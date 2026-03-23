@@ -1,251 +1,107 @@
 import express from 'express';
-import fs from 'fs/promises';
-import path from 'path';
-import crypto from 'crypto';
+import fs from 'fs';
 import pino from 'pino';
-import { makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore, Browsers, jidNormalizedUser } from '@whiskeysockets/baileys';
 import { upload } from './mega.js';
 
 const router = express.Router();
 
-// Configuration
-const CLEANUP_DELAY = 2000;
-const MAX_RETRIES = 3;
-
-// Stockage des sessions actives
-const activeSessions = new Map();
-
-async function removeFile(filePath) {
+// Ensure the session directory exists
+function removeFile(FilePath) {
     try {
-        await fs.rm(filePath, { recursive: true, force: true });
-        return true;
-    } catch (error) {
-        console.error(`Erreur suppression:`, error.message);
-        return false;
+        if (!fs.existsSync(FilePath)) return false;
+        fs.rmSync(FilePath, { recursive: true, force: true });
+    } catch (e) {
+        console.error('Error removing file:', e);
     }
-}
-
-function generateSecureId(length = 10) {
-    return crypto.randomBytes(length).toString('hex');
 }
 
 router.get('/', async (req, res) => {
     let num = req.query.number;
-    let sessionId = generateSecureId();
-    const sessionDir = path.join('./sessions', sessionId);
+    let dirs = './' + (num || `session`);
     
-    num = num?.replace(/[^0-9]/g, '');
+    // Remove existing session if present
+    await removeFile(dirs);
     
-    if (!num || num.length < 10) {
-        return res.status(400).json({ error: 'Numéro invalide' });
-    }
-    
-    console.log(`[${sessionId}] Démarrage pour ${num}`);
-    
-    try {
-        await fs.mkdir(sessionDir, { recursive: true });
-        
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        
-        const GlobalTechInc = makeWASocket({
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-            },
-            printQRInTerminal: false,
-            logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-            browser: ["Ubuntu", "Chrome", "20.0.04"],
-        });
-        
-        activeSessions.set(sessionId, {
-            socket: GlobalTechInc,
-            saveCreds,
-            sessionDir,
-            phoneNumber: num,
-            createdAt: Date.now()
-        });
-        
-        // Gérer la demande de code de pairage
-        if (!GlobalTechInc.authState.creds.registered) {
-            await delay(2000);
-            
-            // IMPORTANT: Le code doit être saisi sur le TÉLÉPHONE de l'utilisateur
-            // Pas dans le bot !
-            const code = await GlobalTechInc.requestPairingCode(num);
-            
-            console.log(`[${sessionId}] Code de pairage généré:`, code);
-            
-            // Envoyer le code à l'utilisateur via la réponse HTTP
-            // L'utilisateur devra saisir ce code sur son téléphone
-            if (!res.headersSent) {
-                return res.json({ 
-                    code: code,
-                    instruction: "Saisissez ce code dans WhatsApp sur votre téléphone",
-                    phoneNumber: num
-                });
+    async function initiateSession() {
+        const { state, saveCreds } = await useMultiFileAuthState(dirs);
+
+        try {
+            let GlobalTechInc = makeWASocket({
+                auth: {
+                    creds: state.creds,
+                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
+                },
+                printQRInTerminal: false,
+                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+                browser: ["Ubuntu", "Chrome", "20.0.04"],
+            });
+
+            if (!GlobalTechInc.authState.creds.registered) {
+                await delay(2000);
+                num = num.replace(/[^0-9]/g, '');
+                const code = await GlobalTechInc.requestPairingCode(num);
+                if (!res.headersSent) {
+                    console.log({ num, code });
+                    await res.send({ code });
+                }
             }
-        }
-        
-        // Gérer les événements de connexion
-        GlobalTechInc.ev.on('creds.update', saveCreds);
-        
-        GlobalTechInc.ev.on("connection.update", async (s) => {
-            const { connection, lastDisconnect } = s;
-            
-            if (connection === "open") {
-                console.log(`[${sessionId}] Connecté avec succès!`);
-                
-                try {
+
+            GlobalTechInc.ev.on('creds.update', saveCreds);
+            GlobalTechInc.ev.on("connection.update", async (s) => {
+                const { connection, lastDisconnect } = s;
+
+                if (connection === "open") {
                     await delay(10000);
-                    
-                    const credsPath = path.join(sessionDir, 'creds.json');
-                    const credsContent = await fs.readFile(credsPath);
-                    
-                    const megaUrl = await upload(credsContent, `${sessionId}.json`);
-                    let sessionString = megaUrl.replace('https://mega.nz/file/', '');
-                    sessionString = "KERM-MD-V1~" + sessionString;
-                    
+                    const sessionGlobal = fs.readFileSync(dirs + '/creds.json');
+
+                    // Helper to generate a random Mega file ID
+                    function generateRandomId(length = 6, numberLength = 4) {
+                        const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+                        let result = '';
+                        for (let i = 0; i < length; i++) {
+                            result += characters.charAt(Math.floor(Math.random() * characters.length));
+                        }
+                        const number = Math.floor(Math.random() * Math.pow(10, numberLength));
+                        return `${result}${number}`;
+                    }
+
+                    // Upload session file to Mega
+                    const megaUrl = await upload(fs.createReadStream(`${dirs}/creds.json`), `${generateRandomId()}.json`);
+                    let stringSession = megaUrl.replace('https://mega.nz/file/', ''); // Extract session ID from URL
+                    stringSession = stringSession;  // Prepend your name to the session ID
+
+                    // Send the session ID to the target number
                     const userJid = jidNormalizedUser(num + '@s.whatsapp.net');
-                    
-                    // Envoyer la session à l'utilisateur
-                    await GlobalTechInc.sendMessage(userJid, { text: sessionString });
-                    
-                    await GlobalTechInc.sendMessage(userJid, { 
-                        text: '✅ *KERM MD V1 SESSION SUCCESSFUL* ✅\n\n' +
-                              '⚠️ *IMPORTANT:* Ne partagez jamais cette session avec personne!\n\n' +
-                              '📱 *Join Channel:* https://whatsapp.com/channel/0029Vafn6hc7DAX3fzsKtn45\n\n' +
-                              '©️ KGTECH'
-                    });
-                    
+                    await GlobalTechInc.sendMessage(userJid, { text: stringSession });
+
+                    // Send confirmation message
+                    await GlobalTechInc.sendMessage(userJid, { text: 'HELLO THERE! 👋 \n\nDO NOT SHARE YOUR SESSION ID WITH ANYONE.\n\nPUT THE ABOVE IN SESSION_ID VAR\n\nTHANKS FOR USING SILENT-SOBX-MD BOT\n\n JOIN SUPPORT CHANNEL:-https://whatsapp.com/channel/0029VaHO5B0G3R3cWkZN970s \n' });
+
+                    // Clean up session after use
                     await delay(100);
-                    await removeFile(sessionDir);
-                    activeSessions.delete(sessionId);
-                    await GlobalTechInc.end();
-                    
-                } catch (err) {
-                    console.error(`[${sessionId}] Erreur post-connexion:`, err);
+                    removeFile(dirs);
+                    process.exit(0);
+                } else if (connection === 'close' && lastDisconnect && lastDisconnect.error && lastDisconnect.error.output.statusCode !== 401) {
+                    console.log('Connection closed unexpectedly:', lastDisconnect.error);
+                    await delay(10000);
+                    initiateSession(); // Retry session initiation if needed
                 }
+            });
+        } catch (err) {
+            console.error('Error initializing session:', err);
+            if (!res.headersSent) {
+                res.status(503).send({ code: 'Service Unavailable' });
             }
-        });
-        
-    } catch (err) {
-        console.error(`[${sessionId}] Erreur:`, err);
-        
-        if (!res.headersSent) {
-            res.status(503).json({ code: 'Service Unavailable', error: err.message });
-        }
-        
-        await removeFile(sessionDir);
-        activeSessions.delete(sessionId);
-    }
-});
-
-// Route pour obtenir le code de pairage (version alternative)
-router.get('/pairing-code', async (req, res) => {
-    let num = req.query.number;
-    num = num?.replace(/[^0-9]/g, '');
-    
-    if (!num || num.length < 10) {
-        return res.status(400).json({ error: 'Numéro invalide' });
-    }
-    
-    const sessionId = generateSecureId();
-    const sessionDir = path.join('./sessions', sessionId);
-    
-    try {
-        await fs.mkdir(sessionDir, { recursive: true });
-        
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-        
-        const socket = makeWASocket({
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-            },
-            printQRInTerminal: false,
-            logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-            browser: ["Ubuntu", "Chrome", "20.0.04"],
-        });
-        
-        // Générer le code de pairage
-        await delay(2000);
-        const code = await socket.requestPairingCode(num);
-        
-        // Stocker la socket pour usage ultérieur
-        activeSessions.set(sessionId, {
-            socket,
-            saveCreds,
-            sessionDir,
-            phoneNumber: num,
-            code: code,
-            createdAt: Date.now()
-        });
-        
-        socket.ev.on('creds.update', saveCreds);
-        
-        // Répondre immédiatement avec le code
-        res.json({
-            success: true,
-            code: code,
-            message: `Saisissez ce code dans WhatsApp sur votre téléphone ${num}`,
-            sessionId: sessionId
-        });
-        
-        // Configurer l'écoute de connexion
-        socket.ev.on("connection.update", async (s) => {
-            const { connection } = s;
-            
-            if (connection === "open") {
-                console.log(`Session ${sessionId} connectée!`);
-                
-                // Une fois connecté, uploader et envoyer la session
-                await delay(5000);
-                
-                try {
-                    const credsPath = path.join(sessionDir, 'creds.json');
-                    const credsContent = await fs.readFile(credsPath);
-                    
-                    const megaUrl = await upload(credsContent, `${sessionId}.json`);
-                    let sessionString = megaUrl.replace('https://mega.nz/file/', '');
-                    sessionString = "KERM-MD-V1~" + sessionString;
-                    
-                    const userJid = jidNormalizedUser(num + '@s.whatsapp.net');
-                    await socket.sendMessage(userJid, { text: sessionString });
-                    
-                    // Nettoyer
-                    await delay(1000);
-                    await removeFile(sessionDir);
-                    activeSessions.delete(sessionId);
-                    await socket.end();
-                    
-                } catch (err) {
-                    console.error(`Erreur upload session ${sessionId}:`, err);
-                }
-            }
-        });
-        
-    } catch (err) {
-        console.error(`Erreur génération code:`, err);
-        res.status(503).json({ code: 'Service Unavailable', error: err.message });
-        await removeFile(sessionDir);
-    }
-});
-
-// Nettoyage automatique
-setInterval(async () => {
-    const now = Date.now();
-    const EXPIRATION_TIME = 10 * 60 * 1000;
-    
-    for (const [sessionId, session] of activeSessions.entries()) {
-        if (now - session.createdAt > EXPIRATION_TIME) {
-            console.log(`Nettoyage session expirée: ${sessionId}`);
-            if (session.socket) {
-                await session.socket.end();
-            }
-            await removeFile(session.sessionDir);
-            activeSessions.delete(sessionId);
         }
     }
-}, 5 * 60 * 1000);
+
+    await initiateSession();
+});
+
+// Global uncaught exception handler
+process.on('uncaughtException', (err) => {
+    console.log('Caught exception: ' + err);
+});
 
 export default router;
