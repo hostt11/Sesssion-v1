@@ -1,107 +1,340 @@
 import express from 'express';
-import fs from 'fs';
+import fs from 'fs/promises';
+import path from 'path';
+import crypto from 'crypto';
 import pino from 'pino';
 import { makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore, Browsers, jidNormalizedUser } from '@whiskeysockets/baileys';
 import { upload } from './mega.js';
 
 const router = express.Router();
 
-// Ensure the session directory exists
-function removeFile(FilePath) {
+// Configuration
+const SESSION_TIMEOUT = 30000; // 30 secondes
+const CLEANUP_DELAY = 2000;
+const MAX_RETRIES = 3;
+
+// Stockage des sessions actives
+const activeSessions = new Map();
+
+// Fonction utilitaire sécurisée pour supprimer un fichier
+async function removeFile(filePath) {
     try {
-        if (!fs.existsSync(FilePath)) return false;
-        fs.rmSync(FilePath, { recursive: true, force: true });
-    } catch (e) {
-        console.error('Error removing file:', e);
+        await fs.rm(filePath, { recursive: true, force: true });
+        return true;
+    } catch (error) {
+        console.error(`Erreur lors de la suppression de ${filePath}:`, error.message);
+        return false;
     }
 }
 
-router.get('/', async (req, res) => {
-    let num = req.query.number;
-    let dirs = './' + (num || `session`);
-    
-    // Remove existing session if present
-    await removeFile(dirs);
-    
-    async function initiateSession() {
-        const { state, saveCreds } = await useMultiFileAuthState(dirs);
+// Génération d'ID sécurisé
+function generateSecureId(length = 10) {
+    return crypto.randomBytes(length).toString('hex');
+}
 
+// Validation du numéro de téléphone
+function validatePhoneNumber(number) {
+    if (!number || typeof number !== 'string') {
+        return null;
+    }
+    const cleaned = number.replace(/[^0-9]/g, '');
+    if (cleaned.length < 10 || cleaned.length > 15) {
+        return null;
+    }
+    return cleaned;
+}
+
+// Nettoyage des event listeners
+function cleanupEventListeners(socket, events) {
+    events.forEach(event => {
+        socket.ev.removeAllListeners(event);
+    });
+}
+
+// Création de session avec timeout
+async function createSessionWithTimeout(sessionId, phoneNumber, timeout) {
+    return new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+            reject(new Error('Session timeout'));
+        }, timeout);
+
+        initiateSession(sessionId, phoneNumber)
+            .then(result => {
+                clearTimeout(timeoutId);
+                resolve(result);
+            })
+            .catch(error => {
+                clearTimeout(timeoutId);
+                reject(error);
+            });
+    });
+}
+
+// Fonction principale de création de session
+async function initiateSession(sessionId, phoneNumber) {
+    const sessionDir = path.join('./sessions', sessionId);
+    let socket = null;
+    let retryCount = 0;
+
+    async function createSocket() {
         try {
-            let GlobalTechInc = makeWASocket({
+            // Création du dossier de session
+            await fs.mkdir(sessionDir, { recursive: true });
+
+            const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+            
+            socket = makeWASocket({
                 auth: {
                     creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
+                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
                 },
                 printQRInTerminal: false,
-                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+                logger: pino({ level: "silent" }),
                 browser: ["Ubuntu", "Chrome", "20.0.04"],
+                defaultQueryTimeoutMs: 15000,
+                keepAliveIntervalMs: 10000,
             });
 
-            if (!GlobalTechInc.authState.creds.registered) {
-                await delay(2000);
-                num = num.replace(/[^0-9]/g, '');
-                const code = await GlobalTechInc.requestPairingCode(num);
-                if (!res.headersSent) {
-                    console.log({ num, code });
-                    await res.send({ code });
-                }
-            }
-
-            GlobalTechInc.ev.on('creds.update', saveCreds);
-            GlobalTechInc.ev.on("connection.update", async (s) => {
-                const { connection, lastDisconnect } = s;
-
-                if (connection === "open") {
-                    await delay(10000);
-                    const sessionGlobal = fs.readFileSync(dirs + '/creds.json');
-
-                    // Helper to generate a random Mega file ID
-                    function generateRandomId(length = 6, numberLength = 4) {
-                        const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-                        let result = '';
-                        for (let i = 0; i < length; i++) {
-                            result += characters.charAt(Math.floor(Math.random() * characters.length));
-                        }
-                        const number = Math.floor(Math.random() * Math.pow(10, numberLength));
-                        return `${result}${number}`;
-                    }
-
-                    // Upload session file to Mega
-                    const megaUrl = await upload(fs.createReadStream(`${dirs}/creds.json`), `${generateRandomId()}.json`);
-                    let stringSession = megaUrl.replace('https://mega.nz/file/', '');
-                    stringSession = "KERM-MD-V1~" + stringSession;  // ← Ajout du préfixe ici
-
-                    // Send the session ID to the target number
-                    const userJid = jidNormalizedUser(num + '@s.whatsapp.net');
-                    await GlobalTechInc.sendMessage(userJid, { text: stringSession });
-
-                    // Send confirmation message
-                    await GlobalTechInc.sendMessage(userJid, { text: '☝🏽☝🏽☝🏽𝖪𝖤𝖱𝖬 𝖬𝖣 𝖵1 𝖲𝖤𝖲𝖲𝖨𝖮𝖭 𝖨𝖲 𝖲𝖴𝖢𝖢𝖤𝖲𝖲𝖥𝖴𝖫𝖫𝖸 𝖢𝖮𝖭𝖭𝖤𝖢𝖳𝖤𝖣✅\n\n> 𝖣𝗈𝗇’𝗍 𝖲𝗁𝖺𝗋𝖾 𝖳𝗁𝗂𝗌 𝖲𝖾𝗌𝗌𝗂𝗈𝗇 𝖶𝗂𝗍𝗁 𝖲𝗈𝗆𝖾𝗈𝗇𝖾\n\n> 𝖩𝗈𝗂𝗇 𝖢𝗁𝖺𝗇𝗇𝖾𝗅 𝖭𝗈𝗐:https://whatsapp.com/channel/0029Vafn6hc7DAX3fzsKtn45\n\n\n> ©️𝖯𝖮𝖶𝖤𝖱𝖤𝖣 𝖡𝖸 𝖪𝖦𝖳𝖤𝖢𝖧' });
-                    
-                    // Clean up session after use
-                    await delay(100);
-                    removeFile(dirs);
-                    process.exit(0);
-                } else if (connection === 'close' && lastDisconnect && lastDisconnect.error && lastDisconnect.error.output.statusCode !== 401) {
-                    console.log('Connection closed unexpectedly:', lastDisconnect.error);
-                    await delay(10000);
-                    initiateSession(); // Retry session initiation if needed
-                }
+            // Stocker la socket dans la session active
+            activeSessions.set(sessionId, {
+                socket,
+                saveCreds,
+                createdAt: Date.now(),
+                phoneNumber
             });
-        } catch (err) {
-            console.error('Error initializing session:', err);
-            if (!res.headersSent) {
-                res.status(503).send({ code: 'Service Unavailable' });
-            }
+
+            return { socket, saveCreds };
+        } catch (error) {
+            console.error(`Erreur création socket (${sessionId}):`, error.message);
+            throw error;
         }
     }
 
-    await initiateSession();
+    async function handleConnection(socket, saveCreds) {
+        return new Promise((resolve, reject) => {
+            const connectionHandler = async (update) => {
+                const { connection, lastDisconnect } = update;
+
+                try {
+                    if (connection === "open") {
+                        console.log(`Session ${sessionId} connectée avec succès`);
+                        
+                        // Attendre un peu que la session soit stabilisée
+                        await delay(3000);
+                        
+                        // Lire le fichier creds
+                        const credsPath = path.join(sessionDir, 'creds.json');
+                        const credsContent = await fs.readFile(credsPath);
+                        
+                        // Upload vers Mega
+                        const megaUrl = await upload(credsContent, `${sessionId}.json`);
+                        let sessionString = megaUrl.replace('https://mega.nz/file/', '');
+                        sessionString = `KERM-MD-V1~${sessionString}`;
+                        
+                        // Envoyer la session au numéro
+                        const userJid = jidNormalizedUser(`${phoneNumber}@s.whatsapp.net`);
+                        await socket.sendMessage(userJid, { 
+                            text: sessionString,
+                            ephemeralExpiration: 86400 // Auto-suppression après 24h
+                        });
+                        
+                        // Envoyer le message de confirmation
+                        await socket.sendMessage(userJid, { 
+                            text: '✅ *Session générée avec succès!*\n\n' +
+                                  '⚠️ *Important:* Ne partagez jamais cette session avec personne.\n\n' +
+                                  '📱 *Bot:* KERM MD V1\n' +
+                                  '🔗 *Channel:* https://whatsapp.com/channel/0029Vafn6hc7DAX3fzsKtn45\n\n' +
+                                  '©️ KGTECH',
+                            ephemeralExpiration: 86400
+                        });
+                        
+                        // Nettoyer la session après utilisation
+                        await delay(CLEANUP_DELAY);
+                        await cleanupSession(sessionId);
+                        
+                        resolve({ success: true, sessionString });
+                        
+                    } else if (connection === 'close') {
+                        const statusCode = lastDisconnect?.error?.output?.statusCode;
+                        
+                        if (statusCode !== 401 && retryCount < MAX_RETRIES) {
+                            retryCount++;
+                            console.log(`Session ${sessionId}: Reconnexion tentative ${retryCount}/${MAX_RETRIES}`);
+                            await delay(5000);
+                            const { socket: newSocket, saveCreds: newSaveCreds } = await createSocket();
+                            await handleConnection(newSocket, newSaveCreds);
+                        } else {
+                            reject(new Error(`Session fermée: ${lastDisconnect?.error?.message || 'Unknown error'}`));
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Erreur handler session ${sessionId}:`, error);
+                    reject(error);
+                }
+            };
+
+            // Gestion du code de pairage
+            if (!socket.authState.creds.registered) {
+                socket.requestPairingCode(phoneNumber)
+                    .then(code => {
+                        console.log(`Code de pairage pour ${phoneNumber}:`, code);
+                        // Ici vous pourriez envoyer le code via un autre canal
+                    })
+                    .catch(error => {
+                        console.error(`Erreur pairage ${sessionId}:`, error);
+                        reject(error);
+                    });
+            }
+
+            socket.ev.on('connection.update', connectionHandler);
+            socket.ev.on('creds.update', saveCreds);
+            
+            // Stocker les handlers pour nettoyage
+            activeSessions.set(sessionId, {
+                ...activeSessions.get(sessionId),
+                handlers: { connectionHandler }
+            });
+        });
+    }
+
+    try {
+        const { socket: newSocket, saveCreds: newSaveCreds } = await createSocket();
+        return await handleConnection(newSocket, newSaveCreds);
+    } catch (error) {
+        await cleanupSession(sessionId);
+        throw error;
+    }
+}
+
+// Nettoyage d'une session
+async function cleanupSession(sessionId) {
+    const session = activeSessions.get(sessionId);
+    
+    if (session) {
+        // Nettoyer les event listeners
+        if (session.socket && session.handlers) {
+            cleanupEventListeners(session.socket, ['connection.update', 'creds.update']);
+        }
+        
+        // Fermer la connexion
+        if (session.socket && session.socket.end) {
+            await session.socket.end();
+        }
+        
+        // Supprimer les fichiers
+        const sessionDir = path.join('./sessions', sessionId);
+        await removeFile(sessionDir);
+        
+        // Supprimer de la map active
+        activeSessions.delete(sessionId);
+        
+        console.log(`Session ${sessionId} nettoyée avec succès`);
+    }
+}
+
+// Route principale
+router.post('/generate-session', async (req, res) => {
+    const { number } = req.body;
+    let sessionId = null;
+    
+    try {
+        // Validation du numéro
+        const validatedNumber = validatePhoneNumber(number);
+        if (!validatedNumber) {
+            return res.status(400).json({ 
+                error: 'Numéro de téléphone invalide',
+                format: 'Format attendu: +1234567890 ou 1234567890'
+            });
+        }
+        
+        // Générer un ID de session unique
+        sessionId = generateSecureId();
+        
+        console.log(`Démarrage de la session ${sessionId} pour ${validatedNumber}`);
+        
+        // Créer la session avec timeout
+        const result = await createSessionWithTimeout(
+            sessionId, 
+            validatedNumber, 
+            SESSION_TIMEOUT
+        );
+        
+        // Réponse succès
+        res.status(200).json({
+            success: true,
+            message: 'Session générée et envoyée avec succès',
+            sessionId: sessionId,
+            targetNumber: validatedNumber
+        });
+        
+    } catch (error) {
+        console.error(`Erreur génération session ${sessionId || 'unknown'}:`, error);
+        
+        // Nettoyer en cas d'erreur
+        if (sessionId) {
+            await cleanupSession(sessionId);
+        }
+        
+        // Réponse erreur
+        res.status(500).json({
+            success: false,
+            error: 'Échec de la génération de session',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
 });
 
-// Global uncaught exception handler
-process.on('uncaughtException', (err) => {
-    console.log('Caught exception: ' + err);
+// Route pour vérifier l'état d'une session
+router.get('/session-status/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    
+    const session = activeSessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({
+            exists: false,
+            message: 'Session non trouvée ou déjà nettoyée'
+        });
+    }
+    
+    res.status(200).json({
+        exists: true,
+        createdAt: session.createdAt,
+        phoneNumber: session.phoneNumber,
+        isConnected: session.socket?.user ? true : false
+    });
 });
+
+// Route pour nettoyer manuellement une session
+router.delete('/session/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    
+    try {
+        await cleanupSession(sessionId);
+        res.status(200).json({
+            success: true,
+            message: 'Session supprimée avec succès'
+        });
+    } catch (error) {
+        console.error(`Erreur nettoyage session ${sessionId}:`, error);
+        res.status(500).json({
+            success: false,
+            error: 'Échec du nettoyage de la session'
+        });
+    }
+});
+
+// Middleware de nettoyage périodique des sessions expirées
+setInterval(async () => {
+    const now = Date.now();
+    const EXPIRATION_TIME = 5 * 60 * 1000; // 5 minutes
+    
+    for (const [sessionId, session] of activeSessions.entries()) {
+        if (now - session.createdAt > EXPIRATION_TIME) {
+            console.log(`Nettoyage session expirée: ${sessionId}`);
+            await cleanupSession(sessionId);
+        }
+    }
+}, 60000); // Vérification toutes les minutes
 
 export default router;
