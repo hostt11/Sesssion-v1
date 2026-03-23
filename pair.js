@@ -15,7 +15,6 @@ const MAX_RETRIES = 3;
 // Stockage des sessions actives
 const activeSessions = new Map();
 
-// Fonction utilitaire pour supprimer un fichier
 async function removeFile(filePath) {
     try {
         await fs.rm(filePath, { recursive: true, force: true });
@@ -26,25 +25,15 @@ async function removeFile(filePath) {
     }
 }
 
-// Génération d'ID sécurisé
 function generateSecureId(length = 10) {
     return crypto.randomBytes(length).toString('hex');
 }
 
-// Nettoyage des event listeners
-function cleanupEventListeners(socket, events) {
-    events.forEach(event => {
-        socket.ev.removeAllListeners(event);
-    });
-}
-
-// Route principale - Version qui envoie le code IMMÉDIATEMENT
 router.get('/', async (req, res) => {
     let num = req.query.number;
     let sessionId = generateSecureId();
     const sessionDir = path.join('./sessions', sessionId);
     
-    // Nettoyer le numéro
     num = num?.replace(/[^0-9]/g, '');
     
     if (!num || num.length < 10) {
@@ -54,13 +43,10 @@ router.get('/', async (req, res) => {
     console.log(`[${sessionId}] Démarrage pour ${num}`);
     
     try {
-        // Créer le dossier de session
         await fs.mkdir(sessionDir, { recursive: true });
         
-        // Configurer l'auth state
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
         
-        // Créer le socket
         const GlobalTechInc = makeWASocket({
             auth: {
                 creds: state.creds,
@@ -71,7 +57,6 @@ router.get('/', async (req, res) => {
             browser: ["Ubuntu", "Chrome", "20.0.04"],
         });
         
-        // Stocker la session
         activeSessions.set(sessionId, {
             socket: GlobalTechInc,
             saveCreds,
@@ -80,20 +65,24 @@ router.get('/', async (req, res) => {
             createdAt: Date.now()
         });
         
-        // Demander le code de pairage IMMÉDIATEMENT
+        // Gérer la demande de code de pairage
         if (!GlobalTechInc.authState.creds.registered) {
-            await delay(2000); // Petit délai comme dans l'original
+            await delay(2000);
+            
+            // IMPORTANT: Le code doit être saisi sur le TÉLÉPHONE de l'utilisateur
+            // Pas dans le bot !
             const code = await GlobalTechInc.requestPairingCode(num);
             
-            // Envoyer le code dans la réponse IMMÉDIATEMENT
-            console.log(`[${sessionId}] Code envoyé:`, code);
+            console.log(`[${sessionId}] Code de pairage généré:`, code);
             
+            // Envoyer le code à l'utilisateur via la réponse HTTP
+            // L'utilisateur devra saisir ce code sur son téléphone
             if (!res.headersSent) {
-                return res.json({ code: code });
-            }
-        } else {
-            if (!res.headersSent) {
-                return res.json({ status: 'already_registered' });
+                return res.json({ 
+                    code: code,
+                    instruction: "Saisissez ce code dans WhatsApp sur votre téléphone",
+                    phoneNumber: num
+                });
             }
         }
         
@@ -104,51 +93,37 @@ router.get('/', async (req, res) => {
             const { connection, lastDisconnect } = s;
             
             if (connection === "open") {
-                console.log(`[${sessionId}] Connecté!`);
+                console.log(`[${sessionId}] Connecté avec succès!`);
                 
                 try {
                     await delay(10000);
                     
-                    // Lire et uploader le fichier creds
                     const credsPath = path.join(sessionDir, 'creds.json');
                     const credsContent = await fs.readFile(credsPath);
                     
-                    // Upload vers Mega
                     const megaUrl = await upload(credsContent, `${sessionId}.json`);
                     let sessionString = megaUrl.replace('https://mega.nz/file/', '');
                     sessionString = "KERM-MD-V1~" + sessionString;
                     
-                    // Envoyer la session
                     const userJid = jidNormalizedUser(num + '@s.whatsapp.net');
+                    
+                    // Envoyer la session à l'utilisateur
                     await GlobalTechInc.sendMessage(userJid, { text: sessionString });
                     
-                    // Message de confirmation
                     await GlobalTechInc.sendMessage(userJid, { 
-                        text: '☝🏽☝🏽☝🏽𝖪𝖤𝖱𝖬 𝖬𝖣 𝖵1 𝖲𝖤𝖲𝖲𝖨𝖮𝖭 𝖨𝖲 𝖲𝖴𝖢𝖢𝖤𝖲𝖲𝖥𝖴𝖫𝖫𝖸 𝖢𝖮𝖭𝖭𝖤𝖢𝖳𝖤𝖣✅\n\n> 𝖣𝗈𝗇’𝗍 𝖲𝗁𝖺𝗋𝖾 𝖳𝗁𝗂𝗌 𝖲𝖾𝗌𝗌𝗂𝗈𝗇 𝖶𝗂𝗍𝗁 𝖲𝗈𝗆𝖾𝗈𝗇𝖾\n\n> 𝖩𝗈𝗂𝗇 𝖢𝗁𝖺𝗇𝗇𝖾𝗅 𝖭𝗈𝗐:https://whatsapp.com/channel/0029Vafn6hc7DAX3fzsKtn45\n\n\n> ©️𝖯𝖮𝖶𝖤𝖱𝖤𝖣 𝖡𝖸 𝖪𝖦𝖳𝖤𝖢𝖧' 
+                        text: '✅ *KERM MD V1 SESSION SUCCESSFUL* ✅\n\n' +
+                              '⚠️ *IMPORTANT:* Ne partagez jamais cette session avec personne!\n\n' +
+                              '📱 *Join Channel:* https://whatsapp.com/channel/0029Vafn6hc7DAX3fzsKtn45\n\n' +
+                              '©️ KGTECH'
                     });
                     
-                    // Nettoyer après envoi
                     await delay(100);
                     await removeFile(sessionDir);
                     activeSessions.delete(sessionId);
-                    
-                    // Ne pas utiliser process.exit() - juste fermer la connexion
                     await GlobalTechInc.end();
                     
                 } catch (err) {
                     console.error(`[${sessionId}] Erreur post-connexion:`, err);
-                }
-                
-            } else if (connection === 'close' && lastDisconnect && lastDisconnect.error?.output?.statusCode !== 401) {
-                console.log(`[${sessionId}] Connexion fermée, reconnexion...`);
-                
-                // Retry avec limite
-                const session = activeSessions.get(sessionId);
-                if (session && session.retryCount < MAX_RETRIES) {
-                    session.retryCount = (session.retryCount || 0) + 1;
-                    activeSessions.set(sessionId, session);
-                    await delay(10000);
-                    // Relancer la connexion
                 }
             }
         });
@@ -157,43 +132,114 @@ router.get('/', async (req, res) => {
         console.error(`[${sessionId}] Erreur:`, err);
         
         if (!res.headersSent) {
-            res.status(503).json({ code: 'Service Unavailable' });
+            res.status(503).json({ code: 'Service Unavailable', error: err.message });
         }
         
-        // Nettoyer
         await removeFile(sessionDir);
         activeSessions.delete(sessionId);
     }
 });
 
-// Route pour nettoyer les sessions orphelines
-router.delete('/cleanup/:sessionId', async (req, res) => {
-    const { sessionId } = req.params;
-    const session = activeSessions.get(sessionId);
+// Route pour obtenir le code de pairage (version alternative)
+router.get('/pairing-code', async (req, res) => {
+    let num = req.query.number;
+    num = num?.replace(/[^0-9]/g, '');
     
-    if (session) {
-        if (session.socket) {
-            cleanupEventListeners(session.socket, ['connection.update', 'creds.update']);
-            await session.socket.end();
-        }
-        await removeFile(session.sessionDir);
-        activeSessions.delete(sessionId);
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: 'Session not found' });
+    if (!num || num.length < 10) {
+        return res.status(400).json({ error: 'Numéro invalide' });
+    }
+    
+    const sessionId = generateSecureId();
+    const sessionDir = path.join('./sessions', sessionId);
+    
+    try {
+        await fs.mkdir(sessionDir, { recursive: true });
+        
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        
+        const socket = makeWASocket({
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
+            },
+            printQRInTerminal: false,
+            logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+            browser: ["Ubuntu", "Chrome", "20.0.04"],
+        });
+        
+        // Générer le code de pairage
+        await delay(2000);
+        const code = await socket.requestPairingCode(num);
+        
+        // Stocker la socket pour usage ultérieur
+        activeSessions.set(sessionId, {
+            socket,
+            saveCreds,
+            sessionDir,
+            phoneNumber: num,
+            code: code,
+            createdAt: Date.now()
+        });
+        
+        socket.ev.on('creds.update', saveCreds);
+        
+        // Répondre immédiatement avec le code
+        res.json({
+            success: true,
+            code: code,
+            message: `Saisissez ce code dans WhatsApp sur votre téléphone ${num}`,
+            sessionId: sessionId
+        });
+        
+        // Configurer l'écoute de connexion
+        socket.ev.on("connection.update", async (s) => {
+            const { connection } = s;
+            
+            if (connection === "open") {
+                console.log(`Session ${sessionId} connectée!`);
+                
+                // Une fois connecté, uploader et envoyer la session
+                await delay(5000);
+                
+                try {
+                    const credsPath = path.join(sessionDir, 'creds.json');
+                    const credsContent = await fs.readFile(credsPath);
+                    
+                    const megaUrl = await upload(credsContent, `${sessionId}.json`);
+                    let sessionString = megaUrl.replace('https://mega.nz/file/', '');
+                    sessionString = "KERM-MD-V1~" + sessionString;
+                    
+                    const userJid = jidNormalizedUser(num + '@s.whatsapp.net');
+                    await socket.sendMessage(userJid, { text: sessionString });
+                    
+                    // Nettoyer
+                    await delay(1000);
+                    await removeFile(sessionDir);
+                    activeSessions.delete(sessionId);
+                    await socket.end();
+                    
+                } catch (err) {
+                    console.error(`Erreur upload session ${sessionId}:`, err);
+                }
+            }
+        });
+        
+    } catch (err) {
+        console.error(`Erreur génération code:`, err);
+        res.status(503).json({ code: 'Service Unavailable', error: err.message });
+        await removeFile(sessionDir);
     }
 });
 
-// Nettoyage automatique toutes les 5 minutes
+// Nettoyage automatique
 setInterval(async () => {
     const now = Date.now();
-    const EXPIRATION_TIME = 10 * 60 * 1000; // 10 minutes
+    const EXPIRATION_TIME = 10 * 60 * 1000;
     
     for (const [sessionId, session] of activeSessions.entries()) {
         if (now - session.createdAt > EXPIRATION_TIME) {
             console.log(`Nettoyage session expirée: ${sessionId}`);
             if (session.socket) {
-                cleanupEventListeners(session.socket, ['connection.update', 'creds.update']);
                 await session.socket.end();
             }
             await removeFile(session.sessionDir);
