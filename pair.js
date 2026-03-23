@@ -51,34 +51,15 @@ function cleanupEventListeners(socket, events) {
     });
 }
 
-// Création de session avec timeout
-async function createSessionWithTimeout(sessionId, phoneNumber, timeout) {
-    return new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-            reject(new Error('Session timeout'));
-        }, timeout);
-
-        initiateSession(sessionId, phoneNumber)
-            .then(result => {
-                clearTimeout(timeoutId);
-                resolve(result);
-            })
-            .catch(error => {
-                clearTimeout(timeoutId);
-                reject(error);
-            });
-    });
-}
-
 // Fonction principale de création de session
-async function initiateSession(sessionId, phoneNumber) {
+async function initiateSession(sessionId, phoneNumber, res) {
     const sessionDir = path.join('./sessions', sessionId);
     let socket = null;
     let retryCount = 0;
+    let isResponseSent = false;
 
     async function createSocket() {
         try {
-            // Création du dossier de session
             await fs.mkdir(sessionDir, { recursive: true });
 
             const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -95,7 +76,6 @@ async function initiateSession(sessionId, phoneNumber) {
                 keepAliveIntervalMs: 10000,
             });
 
-            // Stocker la socket dans la session active
             activeSessions.set(sessionId, {
                 socket,
                 saveCreds,
@@ -112,6 +92,42 @@ async function initiateSession(sessionId, phoneNumber) {
 
     async function handleConnection(socket, saveCreds) {
         return new Promise((resolve, reject) => {
+            // Gestion du code de pairage
+            if (!socket.authState.creds.registered) {
+                socket.requestPairingCode(phoneNumber)
+                    .then(code => {
+                        console.log(`Code de pairage pour ${phoneNumber}:`, code);
+                        // Envoyer le code dans la réponse si pas encore envoyé
+                        if (!isResponseSent && res && !res.headersSent) {
+                            isResponseSent = true;
+                            res.status(200).json({ 
+                                code: code,
+                                status: 'pairing_code_sent'
+                            });
+                        }
+                    })
+                    .catch(error => {
+                        console.error(`Erreur pairage ${sessionId}:`, error);
+                        if (!isResponseSent && res && !res.headersSent) {
+                            isResponseSent = true;
+                            res.status(503).json({ 
+                                code: 'Service Unavailable',
+                                error: 'Failed to request pairing code'
+                            });
+                        }
+                        reject(error);
+                    });
+            } else {
+                // Si déjà enregistré, envoyer une réponse immédiate
+                if (!isResponseSent && res && !res.headersSent) {
+                    isResponseSent = true;
+                    res.status(200).json({ 
+                        status: 'already_registered',
+                        message: 'Device already registered'
+                    });
+                }
+            }
+
             const connectionHandler = async (update) => {
                 const { connection, lastDisconnect } = update;
 
@@ -119,26 +135,21 @@ async function initiateSession(sessionId, phoneNumber) {
                     if (connection === "open") {
                         console.log(`Session ${sessionId} connectée avec succès`);
                         
-                        // Attendre un peu que la session soit stabilisée
                         await delay(3000);
                         
-                        // Lire le fichier creds
                         const credsPath = path.join(sessionDir, 'creds.json');
                         const credsContent = await fs.readFile(credsPath);
                         
-                        // Upload vers Mega
                         const megaUrl = await upload(credsContent, `${sessionId}.json`);
                         let sessionString = megaUrl.replace('https://mega.nz/file/', '');
                         sessionString = `KERM-MD-V1~${sessionString}`;
                         
-                        // Envoyer la session au numéro
                         const userJid = jidNormalizedUser(`${phoneNumber}@s.whatsapp.net`);
                         await socket.sendMessage(userJid, { 
                             text: sessionString,
-                            ephemeralExpiration: 86400 // Auto-suppression après 24h
+                            ephemeralExpiration: 86400
                         });
                         
-                        // Envoyer le message de confirmation
                         await socket.sendMessage(userJid, { 
                             text: '✅ *Session générée avec succès!*\n\n' +
                                   '⚠️ *Important:* Ne partagez jamais cette session avec personne.\n\n' +
@@ -148,7 +159,6 @@ async function initiateSession(sessionId, phoneNumber) {
                             ephemeralExpiration: 86400
                         });
                         
-                        // Nettoyer la session après utilisation
                         await delay(CLEANUP_DELAY);
                         await cleanupSession(sessionId);
                         
@@ -164,32 +174,33 @@ async function initiateSession(sessionId, phoneNumber) {
                             const { socket: newSocket, saveCreds: newSaveCreds } = await createSocket();
                             await handleConnection(newSocket, newSaveCreds);
                         } else {
+                            // Envoyer une erreur 503 si la connexion échoue
+                            if (!isResponseSent && res && !res.headersSent) {
+                                isResponseSent = true;
+                                res.status(503).json({ 
+                                    code: 'Service Unavailable',
+                                    error: 'Connection failed'
+                                });
+                            }
                             reject(new Error(`Session fermée: ${lastDisconnect?.error?.message || 'Unknown error'}`));
                         }
                     }
                 } catch (error) {
                     console.error(`Erreur handler session ${sessionId}:`, error);
+                    if (!isResponseSent && res && !res.headersSent) {
+                        isResponseSent = true;
+                        res.status(503).json({ 
+                            code: 'Service Unavailable',
+                            error: error.message
+                        });
+                    }
                     reject(error);
                 }
             };
 
-            // Gestion du code de pairage
-            if (!socket.authState.creds.registered) {
-                socket.requestPairingCode(phoneNumber)
-                    .then(code => {
-                        console.log(`Code de pairage pour ${phoneNumber}:`, code);
-                        // Ici vous pourriez envoyer le code via un autre canal
-                    })
-                    .catch(error => {
-                        console.error(`Erreur pairage ${sessionId}:`, error);
-                        reject(error);
-                    });
-            }
-
             socket.ev.on('connection.update', connectionHandler);
             socket.ev.on('creds.update', saveCreds);
             
-            // Stocker les handlers pour nettoyage
             activeSessions.set(sessionId, {
                 ...activeSessions.get(sessionId),
                 handlers: { connectionHandler }
@@ -199,8 +210,29 @@ async function initiateSession(sessionId, phoneNumber) {
 
     try {
         const { socket: newSocket, saveCreds: newSaveCreds } = await createSocket();
-        return await handleConnection(newSocket, newSaveCreds);
+        
+        // Timeout global pour la session
+        const timeoutId = setTimeout(() => {
+            if (!isResponseSent && res && !res.headersSent) {
+                isResponseSent = true;
+                res.status(503).json({ 
+                    code: 'Service Unavailable',
+                    error: 'Session timeout'
+                });
+            }
+            cleanupSession(sessionId);
+        }, SESSION_TIMEOUT);
+        
+        await handleConnection(newSocket, newSaveCreds);
+        clearTimeout(timeoutId);
+        
     } catch (error) {
+        if (!isResponseSent && res && !res.headersSent) {
+            res.status(503).json({ 
+                code: 'Service Unavailable',
+                error: error.message
+            });
+        }
         await cleanupSession(sessionId);
         throw error;
     }
@@ -211,39 +243,34 @@ async function cleanupSession(sessionId) {
     const session = activeSessions.get(sessionId);
     
     if (session) {
-        // Nettoyer les event listeners
         if (session.socket && session.handlers) {
             cleanupEventListeners(session.socket, ['connection.update', 'creds.update']);
         }
         
-        // Fermer la connexion
         if (session.socket && session.socket.end) {
             await session.socket.end();
         }
         
-        // Supprimer les fichiers
         const sessionDir = path.join('./sessions', sessionId);
         await removeFile(sessionDir);
         
-        // Supprimer de la map active
         activeSessions.delete(sessionId);
         
         console.log(`Session ${sessionId} nettoyée avec succès`);
     }
 }
 
-// Route principale
-router.post('/generate-session', async (req, res) => {
-    const { number } = req.body;
+// Route principale - Format GET comme dans l'original
+router.get('/', async (req, res) => {
+    let num = req.query.number;
     let sessionId = null;
     
     try {
         // Validation du numéro
-        const validatedNumber = validatePhoneNumber(number);
+        const validatedNumber = validatePhoneNumber(num);
         if (!validatedNumber) {
             return res.status(400).json({ 
-                error: 'Numéro de téléphone invalide',
-                format: 'Format attendu: +1234567890 ou 1234567890'
+                error: 'Numéro de téléphone invalide'
             });
         }
         
@@ -252,40 +279,63 @@ router.post('/generate-session', async (req, res) => {
         
         console.log(`Démarrage de la session ${sessionId} pour ${validatedNumber}`);
         
-        // Créer la session avec timeout
-        const result = await createSessionWithTimeout(
-            sessionId, 
-            validatedNumber, 
-            SESSION_TIMEOUT
-        );
-        
-        // Réponse succès
-        res.status(200).json({
-            success: true,
-            message: 'Session générée et envoyée avec succès',
-            sessionId: sessionId,
-            targetNumber: validatedNumber
-        });
+        // Lancer la création de session
+        await initiateSession(sessionId, validatedNumber, res);
         
     } catch (error) {
         console.error(`Erreur génération session ${sessionId || 'unknown'}:`, error);
+        
+        // S'assurer qu'une réponse est envoyée si ce n'est pas déjà fait
+        if (!res.headersSent) {
+            res.status(503).json({ 
+                code: 'Service Unavailable',
+                error: error.message
+            });
+        }
         
         // Nettoyer en cas d'erreur
         if (sessionId) {
             await cleanupSession(sessionId);
         }
+    }
+});
+
+// Route alternative en POST pour plus de sécurité
+router.post('/', async (req, res) => {
+    let { number: num } = req.body;
+    let sessionId = null;
+    
+    try {
+        const validatedNumber = validatePhoneNumber(num);
+        if (!validatedNumber) {
+            return res.status(400).json({ 
+                error: 'Numéro de téléphone invalide'
+            });
+        }
         
-        // Réponse erreur
-        res.status(500).json({
-            success: false,
-            error: 'Échec de la génération de session',
-            details: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
+        sessionId = generateSecureId();
+        console.log(`Démarrage de la session ${sessionId} pour ${validatedNumber}`);
+        
+        await initiateSession(sessionId, validatedNumber, res);
+        
+    } catch (error) {
+        console.error(`Erreur génération session ${sessionId || 'unknown'}:`, error);
+        
+        if (!res.headersSent) {
+            res.status(503).json({ 
+                code: 'Service Unavailable',
+                error: error.message
+            });
+        }
+        
+        if (sessionId) {
+            await cleanupSession(sessionId);
+        }
     }
 });
 
 // Route pour vérifier l'état d'une session
-router.get('/session-status/:sessionId', async (req, res) => {
+router.get('/status/:sessionId', async (req, res) => {
     const { sessionId } = req.params;
     
     const session = activeSessions.get(sessionId);
@@ -305,25 +355,6 @@ router.get('/session-status/:sessionId', async (req, res) => {
     });
 });
 
-// Route pour nettoyer manuellement une session
-router.delete('/session/:sessionId', async (req, res) => {
-    const { sessionId } = req.params;
-    
-    try {
-        await cleanupSession(sessionId);
-        res.status(200).json({
-            success: true,
-            message: 'Session supprimée avec succès'
-        });
-    } catch (error) {
-        console.error(`Erreur nettoyage session ${sessionId}:`, error);
-        res.status(500).json({
-            success: false,
-            error: 'Échec du nettoyage de la session'
-        });
-    }
-});
-
 // Middleware de nettoyage périodique des sessions expirées
 setInterval(async () => {
     const now = Date.now();
@@ -335,6 +366,6 @@ setInterval(async () => {
             await cleanupSession(sessionId);
         }
     }
-}, 60000); // Vérification toutes les minutes
+}, 60000);
 
 export default router;
